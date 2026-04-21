@@ -3,29 +3,34 @@ import { useEffect, useRef, useState, useCallback } from "react";
 
 export interface MotionReading {
   timestamp: number;
-  zAccel: number;   // m/s² (gravity subtracted) — negative = downward dip
-  gyroX: number;    // deg/s
-  gyroY: number;    // deg/s
+  zAccel: number;        // gravity-free Z in m/s² — spikes on road bumps
+  gyroX: number;         // deg/s
+  gyroY: number;         // deg/s
   anomalyDetected: boolean;
 }
 
 export type MotionStatus =
   | "idle"
-  | "requesting"       // waiting for iOS permission prompt
-  | "denied"           // user refused / API unavailable
-  | "mock"             // desktop fallback
-  | "live";            // real hardware
+  | "requesting"   // waiting for iOS permission prompt
+  | "denied"
+  | "mock"         // desktop fallback — no real sensor
+  | "live";        // real hardware
 
-const ANOMALY_THRESHOLD_MS2 = 8;  // m/s² — tunable
+// A bump/pothole causes a sudden Z spike of ~2–6 m/s² above baseline.
+// Threshold is intentionally low so it reacts to real road roughness.
+export const ANOMALY_THRESHOLD_MS2 = 3.5;
+
 const MOCK_INTERVAL_MS = 200;
+// How many samples to average for the dynamic gravity baseline
+const BASELINE_WINDOW = 20;
 
 function mockReading(): MotionReading {
   const spike = Math.random() > 0.87;
   return {
     timestamp: Date.now(),
-    zAccel: spike ? -(10 + Math.random() * 8) : -(Math.random() * 1.5),
-    gyroX: spike ? (Math.random() - 0.5) * 80 : (Math.random() - 0.5) * 5,
-    gyroY: spike ? (Math.random() - 0.5) * 80 : (Math.random() - 0.5) * 5,
+    zAccel: spike ? -(4 + Math.random() * 6) : (Math.random() - 0.5) * 0.8,
+    gyroX: spike ? (Math.random() - 0.5) * 60 : (Math.random() - 0.5) * 4,
+    gyroY: spike ? (Math.random() - 0.5) * 60 : (Math.random() - 0.5) * 4,
     anomalyDetected: spike,
   };
 }
@@ -33,8 +38,11 @@ function mockReading(): MotionReading {
 export function useDeviceMotion(active: boolean) {
   const [readings, setReadings] = useState<MotionReading[]>([]);
   const [status, setStatus] = useState<MotionStatus>("idle");
+
   const mockTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const listenerRef = useRef<((e: DeviceMotionEvent) => void) | null>(null);
+  // Rolling buffer of raw Z values used to compute a dynamic gravity baseline
+  const baselineBuffer = useRef<number[]>([]);
 
   const pushReading = useCallback((r: MotionReading) => {
     setReadings((prev) => [...prev.slice(-200), r]);
@@ -51,16 +59,36 @@ export function useDeviceMotion(active: boolean) {
 
   const startLive = useCallback(() => {
     setStatus("live");
-    const handler = (e: DeviceMotionEvent) => {
-      const acc = e.accelerationIncludingGravity;
-      const rot = e.rotationRate;
-      if (!acc) return;
+    baselineBuffer.current = [];
 
-      // z-axis: subtract ~9.81 (gravity) when phone is flat
-      const rawZ = acc.z ?? 0;
-      const zAccel = rawZ - 9.81;
-      const gyroX = rot?.alpha ?? 0;
-      const gyroY = rot?.beta ?? 0;
+    const handler = (e: DeviceMotionEvent) => {
+      const rot = e.rotationRate;
+
+      // Prefer `acceleration` (OS already removes gravity via sensor fusion).
+      // Fall back to `accelerationIncludingGravity` with a rolling baseline if unavailable.
+      let zAccel: number;
+
+      if (e.acceleration?.z != null) {
+        zAccel = e.acceleration.z;
+      } else {
+        const rawZ = e.accelerationIncludingGravity?.z ?? 0;
+        // Build a rolling baseline of the last N raw-Z samples.
+        // This adapts to any phone orientation (portrait, landscape, tilted).
+        baselineBuffer.current.push(rawZ);
+        if (baselineBuffer.current.length > BASELINE_WINDOW) {
+          baselineBuffer.current.shift();
+        }
+        const baseline =
+          baselineBuffer.current.reduce((s, v) => s + v, 0) /
+          baselineBuffer.current.length;
+        // During the warm-up window just emit the raw Z so waveform moves immediately
+        zAccel = baselineBuffer.current.length < BASELINE_WINDOW
+          ? rawZ - baseline   // partial baseline is still better than nothing
+          : rawZ - baseline;
+      }
+
+      const gyroX = rot?.beta  ?? 0;   // beta  = tilt front/back
+      const gyroY = rot?.gamma ?? 0;   // gamma = tilt left/right
 
       pushReading({
         timestamp: Date.now(),
@@ -70,6 +98,7 @@ export function useDeviceMotion(active: boolean) {
         anomalyDetected: Math.abs(zAccel) > ANOMALY_THRESHOLD_MS2,
       });
     };
+
     listenerRef.current = handler;
     window.addEventListener("devicemotion", handler);
   }, [pushReading]);
@@ -79,6 +108,7 @@ export function useDeviceMotion(active: boolean) {
       window.removeEventListener("devicemotion", listenerRef.current);
       listenerRef.current = null;
     }
+    baselineBuffer.current = [];
   }, []);
 
   useEffect(() => {
@@ -89,34 +119,45 @@ export function useDeviceMotion(active: boolean) {
       return;
     }
 
-    // Check if DeviceMotionEvent is available
     if (typeof DeviceMotionEvent === "undefined") {
       startMock();
       return;
     }
 
-    // iOS 13+ requires explicit permission
-    if (typeof (DeviceMotionEvent as unknown as { requestPermission?: () => Promise<string> }).requestPermission === "function") {
+    // iOS 13+ requires explicit permission — must be triggered by a user gesture
+    const DME = DeviceMotionEvent as unknown as {
+      requestPermission?: () => Promise<PermissionState>;
+    };
+
+    if (typeof DME.requestPermission === "function") {
       setStatus("requesting");
-      (DeviceMotionEvent as unknown as { requestPermission: () => Promise<string> })
-        .requestPermission()
+      DME.requestPermission()
         .then((result) => {
           if (result === "granted") startLive();
-          else startMock(); // Denied — fall back to mock
+          else { setStatus("denied"); startMock(); }
         })
-        .catch(() => startMock());
+        .catch(() => { setStatus("denied"); startMock(); });
     } else {
-      // Android / non-iOS — DeviceMotion available without permission
-      // Test if we actually get events (desktop browsers expose the API but fire nothing)
+      // Android / desktop: attach listener and wait briefly to confirm events fire.
+      // Desktop browsers expose DeviceMotionEvent but never dispatch it.
       let gotEvent = false;
-      const testHandler = () => { gotEvent = true; };
-      window.addEventListener("devicemotion", testHandler);
+      const probe = (e: DeviceMotionEvent) => {
+        // A real device will have non-null acceleration values
+        if (
+          e.acceleration != null ||
+          e.accelerationIncludingGravity?.x != null ||
+          e.accelerationIncludingGravity?.z != null
+        ) {
+          gotEvent = true;
+        }
+      };
+      window.addEventListener("devicemotion", probe);
 
       setTimeout(() => {
-        window.removeEventListener("devicemotion", testHandler);
+        window.removeEventListener("devicemotion", probe);
         if (gotEvent) startLive();
         else startMock();
-      }, 500);
+      }, 600);
     }
 
     return () => { stopMock(); stopLive(); };

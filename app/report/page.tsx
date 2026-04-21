@@ -5,15 +5,14 @@ import {
   ChevronLeft, PhoneCall, MapPin, Camera, Navigation,
   Play, Square, Activity, AlertTriangle, Smartphone, Monitor,
 } from "lucide-react";
-import { useDeviceMotion } from "@/lib/useDeviceMotion";
-
-const ANOMALY_THRESHOLD = 8; // m/s²
+import { useDeviceMotion, ANOMALY_THRESHOLD_MS2 } from "@/lib/useDeviceMotion";
 
 export default function ReportPage() {
   const [tripActive, setTripActive] = useState(false);
   const { readings, status: motionStatus } = useDeviceMotion(tripActive);
   const [sosPressed, setSosPressed] = useState(false);
   const [form, setForm] = useState({ type: "pothole", description: "", gps: "", lat: 0, lng: 0 });
+  const [hasGps, setHasGps] = useState(false);
   const [submitState, setSubmitState] = useState<"idle" | "submitting" | "success" | "error">("idle");
   const [gpsLoading, setGpsLoading] = useState(false);
   const photoRef = useRef<HTMLInputElement>(null);
@@ -25,7 +24,7 @@ export default function ReportPage() {
 
   // Auto-report anomaly from sensor to backend while trip is active
   const lastAutoReport = useRef(0);
-  if (latest?.anomalyDetected && form.lat && form.lng) {
+  if (latest?.anomalyDetected && hasGps) {
     const now = Date.now();
     if (now - lastAutoReport.current > 3000) {
       lastAutoReport.current = now;
@@ -54,11 +53,12 @@ export default function ReportPage() {
           lng: longitude,
           gps: `${latitude.toFixed(5)}° N, ${longitude.toFixed(5)}° E`,
         }));
+        setHasGps(true);
         setGpsLoading(false);
       },
       () => {
-        // fallback to Bengaluru center if denied
         setForm((f) => ({ ...f, lat: 12.9784, lng: 77.6408, gps: "12.97840° N, 77.64080° E (approx)" }));
+        setHasGps(true);
         setGpsLoading(false);
       },
       { enableHighAccuracy: true, timeout: 8000 }
@@ -67,7 +67,7 @@ export default function ReportPage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!form.lat && !form.lng) {
+    if (!hasGps) {
       detectGPS();
       return;
     }
@@ -180,7 +180,7 @@ export default function ReportPage() {
                 <div className="mb-3 bg-amber-500/20 border border-amber-500/30 rounded-lg px-3 py-2 text-amber-400 text-sm flex items-center gap-2">
                   <AlertTriangle size={14} />
                   Anomaly detected! Z = {latest?.zAccel.toFixed(2)} m/s²
-                  {form.lat ? " — auto-reported" : " — enable GPS to auto-report"}
+                  {hasGps ? " — auto-reported" : " — tap GPS to auto-report"}
                 </div>
               )}
 
@@ -189,7 +189,7 @@ export default function ReportPage() {
                   {
                     label: "Z-Accel (m/s²)",
                     value: latest?.zAccel.toFixed(3) ?? "—",
-                    color: Math.abs(latest?.zAccel ?? 0) > ANOMALY_THRESHOLD ? "text-red-400" : "text-green-400",
+                    color: Math.abs(latest?.zAccel ?? 0) > ANOMALY_THRESHOLD_MS2 ? "text-red-400" : "text-green-400",
                   },
                   {
                     label: "Gyro X (°/s)",
@@ -222,7 +222,7 @@ export default function ReportPage() {
                   })}
                 </div>
                 <p className="text-[#6b7280] text-[10px]">
-                  Z-axis waveform · {readings.length} samples · Red = anomaly spike (&gt;{ANOMALY_THRESHOLD} m/s²)
+                  Z-axis waveform · {readings.length} samples · Red = anomaly spike (&gt;{ANOMALY_THRESHOLD_MS2} m/s²)
                 </p>
               </div>
             </>
