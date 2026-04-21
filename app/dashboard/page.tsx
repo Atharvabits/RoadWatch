@@ -1,10 +1,9 @@
 "use client";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
-import { MapPin, AlertTriangle, Activity, Zap, ChevronLeft, Wifi } from "lucide-react";
-import { RoadAnomaly, MOCK_ANOMALIES } from "@/lib/types";
-import { createMockWebSocket } from "@/lib/mock-websocket";
+import { MapPin, AlertTriangle, Activity, Zap, ChevronLeft, Wifi, WifiOff } from "lucide-react";
+import { RoadAnomaly } from "@/lib/types";
 
 const RoadMap = dynamic(() => import("@/components/RoadMap"), { ssr: false });
 
@@ -33,21 +32,48 @@ const typeIcon: Record<string, string> = {
   breakdown: "🚨",
 };
 
-export default function Dashboard() {
-  const [anomalies, setAnomalies] = useState<RoadAnomaly[]>(MOCK_ANOMALIES);
-  const [feed, setFeed] = useState<RoadAnomaly[]>([...MOCK_ANOMALIES].slice(0, 8).reverse());
-  const [wsConnected, setWsConnected] = useState(false);
+type SSEStatus = "connecting" | "connected" | "error" | "closed";
 
-  const handleNewAnomaly = useCallback((a: RoadAnomaly) => {
-    setAnomalies((prev) => [...prev, a]);
-    setFeed((prev) => [a, ...prev].slice(0, 20));
-  }, []);
+export default function Dashboard() {
+  const [anomalies, setAnomalies] = useState<RoadAnomaly[]>([]);
+  const [feed, setFeed] = useState<RoadAnomaly[]>([]);
+  const [sseStatus, setSseStatus] = useState<SSEStatus>("connecting");
+  const esRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
-    setWsConnected(true);
-    const cleanup = createMockWebSocket(handleNewAnomaly);
-    return () => { cleanup(); setWsConnected(false); };
-  }, [handleNewAnomaly]);
+    function connect() {
+      setSseStatus("connecting");
+      const es = new EventSource("/api/anomalies");
+      esRef.current = es;
+
+      es.addEventListener("seed", (e) => {
+        const data: RoadAnomaly[] = JSON.parse(e.data);
+        setAnomalies(data);
+        // Show the 15 most recent in the feed, newest-first
+        setFeed([...data].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()).slice(0, 15));
+        setSseStatus("connected");
+      });
+
+      es.addEventListener("anomaly", (e) => {
+        const a: RoadAnomaly = JSON.parse(e.data);
+        setAnomalies((prev) => [...prev, a]);
+        setFeed((prev) => [a, ...prev].slice(0, 30));
+      });
+
+      es.onerror = () => {
+        setSseStatus("error");
+        es.close();
+        // Reconnect after 3s
+        setTimeout(connect, 3000);
+      };
+    }
+
+    connect();
+
+    return () => {
+      esRef.current?.close();
+    };
+  }, []);
 
   const potholes = anomalies.filter((a) => a.type === "pothole").length;
   const breakdowns = anomalies.filter((a) => a.type === "breakdown").length;
@@ -56,7 +82,6 @@ export default function Dashboard() {
 
   return (
     <div className="h-screen bg-[#0a0a0f] text-[#e2e8f0] flex flex-col overflow-hidden">
-      {/* Topbar */}
       <header className="border-b border-[#2a2a3a] px-4 py-3 flex items-center gap-4 shrink-0">
         <Link href="/" className="flex items-center gap-1 text-[#6b7280] hover:text-[#e2e8f0] transition-colors text-sm">
           <ChevronLeft size={14} /> Back
@@ -68,9 +93,9 @@ export default function Dashboard() {
           <span className="font-semibold text-sm">RoadWatch — Live Dashboard</span>
         </div>
         <div className="ml-auto flex items-center gap-3">
-          <div className={`flex items-center gap-1.5 text-xs ${wsConnected ? "text-green-400" : "text-red-400"}`}>
-            <Wifi size={12} />
-            {wsConnected ? "WS Connected" : "Disconnected"}
+          <div className={`flex items-center gap-1.5 text-xs ${sseStatus === "connected" ? "text-green-400" : sseStatus === "connecting" ? "text-amber-400" : "text-red-400"}`}>
+            {sseStatus === "connected" ? <Wifi size={12} /> : <WifiOff size={12} />}
+            {sseStatus === "connected" ? "SSE Live" : sseStatus === "connecting" ? "Connecting…" : "Reconnecting…"}
           </div>
           <div className="flex items-center gap-1.5 text-xs text-[#6b7280]">
             <div className="w-1.5 h-1.5 rounded-full bg-green-400 live-indicator" />
@@ -79,7 +104,6 @@ export default function Dashboard() {
         </div>
       </header>
 
-      {/* Bento stats */}
       <div className="px-4 pt-3 pb-2 grid grid-cols-4 gap-3 shrink-0">
         {[
           { label: "Total Potholes", value: potholes, icon: "🕳️", color: "text-blue-400" },
@@ -97,12 +121,9 @@ export default function Dashboard() {
         ))}
       </div>
 
-      {/* Main content */}
-      <div className="flex flex-1 gap-0 overflow-hidden px-4 pb-4 gap-3">
-        {/* Map */}
+      <div className="flex flex-1 overflow-hidden px-4 pb-4 gap-3">
         <div className="flex-1 rounded-xl overflow-hidden border border-[#2a2a3a] relative">
           <RoadMap anomalies={anomalies} />
-          {/* Legend overlay */}
           <div className="absolute bottom-4 left-4 bg-[#111118]/90 border border-[#2a2a3a] rounded-lg p-3 text-xs space-y-1.5 backdrop-blur">
             <div className="text-[#6b7280] font-medium mb-1">LEGEND</div>
             {[
@@ -123,7 +144,6 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Live feed sidebar */}
         <div className="w-72 shrink-0 flex flex-col bg-[#111118] border border-[#2a2a3a] rounded-xl overflow-hidden">
           <div className="px-4 py-3 border-b border-[#2a2a3a] flex items-center gap-2">
             <Zap size={14} className="text-blue-400" />
@@ -131,6 +151,11 @@ export default function Dashboard() {
             <span className="ml-auto text-xs text-[#6b7280] bg-[#2a2a3a] px-2 py-0.5 rounded-full">{feed.length}</span>
           </div>
           <div className="flex-1 overflow-y-auto divide-y divide-[#2a2a3a]">
+            {feed.length === 0 && (
+              <div className="px-4 py-8 text-center text-[#6b7280] text-xs">
+                {sseStatus === "connecting" ? "Connecting to feed…" : "No anomalies yet. Submit a report to see it here."}
+              </div>
+            )}
             {feed.map((a) => (
               <div key={a.id} className="px-4 py-3 hover:bg-[#1a1a24] transition-colors anomaly-item">
                 <div className="flex items-start gap-2">
@@ -143,7 +168,8 @@ export default function Dashboard() {
                       <span className="text-xs text-[#6b7280] capitalize">{a.type}</span>
                     </div>
                     <p className="text-xs text-[#e2e8f0] font-medium truncate">
-                      {a.type === "breakdown" ? "⚡ Breakdown reported" : a.type === "speedbreaker" ? "Unmarked speed breaker" : "Sharp dip detected"} near <span className="text-blue-400">{a.location}</span>
+                      {a.type === "breakdown" ? "Breakdown reported" : a.type === "speedbreaker" ? "Unmarked speed breaker" : "Sharp dip detected"} near{" "}
+                      <span className="text-blue-400">{a.location}</span>
                     </p>
                     <div className="flex items-center gap-2 mt-1">
                       <span className="text-[10px] text-[#6b7280]">{timeAgo(a.timestamp)}</span>
