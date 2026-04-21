@@ -152,8 +152,15 @@ export default function Dashboard() {
           </div>
           <div className="flex-1 overflow-y-auto divide-y divide-[#2a2a3a]">
             {feed.length === 0 && (
-              <div className="px-4 py-8 text-center text-[#6b7280] text-xs">
-                {sseStatus === "connecting" ? "Connecting to feed…" : "No anomalies yet. Submit a report to see it here."}
+              <div className="px-4 py-8 text-center text-[#6b7280] text-xs space-y-1">
+                {sseStatus === "connecting" ? (
+                  <p>Connecting to feed…</p>
+                ) : (
+                  <>
+                    <p className="text-[#e2e8f0] font-medium">No reports yet</p>
+                    <p>Start a trip or submit a report from the Report page to see live data here.</p>
+                  </>
+                )}
               </div>
             )}
             {feed.map((a) => (

@@ -1,16 +1,12 @@
-// In-memory store shared across the Next.js process.
-// Swap this out for a real DB (Drizzle/Postgres) when the Go backend is ready.
+// SSE pub/sub — in-process only, intentionally not persisted.
+// Persistence is handled by Neon via Drizzle in route.ts.
 
-import { RoadAnomaly, MOCK_ANOMALIES } from "@/lib/types";
-
-// Seeded with mock data so the dashboard isn't empty on first load.
-export const anomalyStore: RoadAnomaly[] = [...MOCK_ANOMALIES];
+import { RoadAnomaly } from "@/lib/types";
 
 type Listener = (anomaly: RoadAnomaly) => void;
 const listeners = new Set<Listener>();
 
-export function addAnomaly(a: RoadAnomaly) {
-  anomalyStore.push(a);
+export function broadcast(a: RoadAnomaly) {
   listeners.forEach((fn) => fn(a));
 }
 

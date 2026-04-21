@@ -1,8 +1,8 @@
 "use client";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Link from "next/link";
 import { ChevronLeft, Shield, ArrowUpDown, CheckCircle, Wrench, AlertTriangle } from "lucide-react";
-import { RoadAnomaly, MOCK_ANOMALIES, MOCK_CREWS } from "@/lib/types";
+import { RoadAnomaly, MOCK_CREWS } from "@/lib/types";
 
 type SortKey = "intensity" | "hits" | "timestamp";
 
@@ -39,13 +39,29 @@ function IntensityBar({ value }: { value: number }) {
 }
 
 export default function AuthorityPage() {
-  const [rows, setRows] = useState<RoadAnomaly[]>(
-    [...MOCK_ANOMALIES].filter((a) => a.type !== "breakdown").sort((a, b) => (b.intensity ?? 0) - (a.intensity ?? 0))
-  );
+  const [rows, setRows] = useState<RoadAnomaly[]>([]);
   const [sortKey, setSortKey] = useState<SortKey>("intensity");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [dispatching, setDispatching] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | "pothole" | "speedbreaker">("all");
+
+  // Subscribe to SSE — same feed as dashboard
+  useEffect(() => {
+    const es = new EventSource("/api/anomalies");
+
+    es.addEventListener("seed", (e) => {
+      const data: RoadAnomaly[] = JSON.parse(e.data);
+      setRows(data.filter((a) => a.type !== "breakdown").sort((a, b) => (b.intensity ?? 0) - (a.intensity ?? 0)));
+    });
+
+    es.addEventListener("anomaly", (e) => {
+      const a: RoadAnomaly = JSON.parse(e.data);
+      if (a.type === "breakdown") return;
+      setRows((prev) => [a, ...prev]);
+    });
+
+    return () => es.close();
+  }, []);
 
   function toggleSort(key: SortKey) {
     if (sortKey === key) {
@@ -162,6 +178,13 @@ export default function AuthorityPage() {
                 </tr>
               </thead>
               <tbody>
+                {displayed.length === 0 && (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-10 text-center text-[#6b7280] text-sm">
+                      No reports yet. Start a trip or submit a report from the Report page.
+                    </td>
+                  </tr>
+                )}
                 {displayed.map((row, i) => (
                   <tr key={row.id} className={`border-b border-[#1a1a24] hover:bg-[#1a1a24] transition-colors ${i % 2 === 0 ? "" : "bg-[#0d0d15]"}`}>
                     <td className="px-4 py-3">

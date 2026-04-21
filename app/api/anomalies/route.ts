@@ -1,21 +1,39 @@
 import { NextRequest, NextResponse } from "next/server";
-import { RoadAnomaly } from "@/lib/types";
-import { anomalyStore, addAnomaly, subscribe } from "./store";
 import { randomUUID } from "crypto";
+import { desc } from "drizzle-orm";
+import { db } from "@/db";
+import { anomalies } from "@/db/schema";
+import { RoadAnomaly } from "@/lib/types";
+import { broadcast, subscribe } from "./store";
 
-// GET  /api/anomalies        — SSE stream of new anomalies
-// POST /api/anomalies        — submit a new anomaly (from report form or Go backend)
+// GET  /api/anomalies  — SSE stream; seeds with last 200 DB rows then pushes new ones live
+// POST /api/anomalies  — persist a new anomaly and broadcast it to all SSE clients
 
 export async function GET() {
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
-    start(controller) {
-      // Send all existing anomalies as a seed event so new clients are immediately populated
-      const seed = JSON.stringify(anomalyStore);
-      controller.enqueue(encoder.encode(`event: seed\ndata: ${seed}\n\n`));
+    async start(controller) {
+      // Fetch the last 200 anomalies from Neon as the seed
+      let seed: RoadAnomaly[] = [];
+      try {
+        const rows = await db
+          .select()
+          .from(anomalies)
+          .orderBy(desc(anomalies.createdAt))
+          .limit(200);
 
-      // Then stream new ones as they arrive
+        seed = rows.map(rowToAnomaly).reverse(); // oldest-first so the feed renders in order
+      } catch (err) {
+        console.error("Failed to seed SSE from DB:", err);
+      }
+
+      try {
+        controller.enqueue(encoder.encode(`event: seed\ndata: ${JSON.stringify(seed)}\n\n`));
+      } catch {
+        return;
+      }
+
       const unsub = subscribe((anomaly) => {
         try {
           controller.enqueue(
@@ -26,7 +44,6 @@ export async function GET() {
         }
       });
 
-      // Heartbeat every 25s to keep the connection alive through proxies
       const heartbeat = setInterval(() => {
         try {
           controller.enqueue(encoder.encode(": heartbeat\n\n"));
@@ -36,7 +53,6 @@ export async function GET() {
         }
       }, 25_000);
 
-      // Cleanup when client disconnects
       return () => {
         clearInterval(heartbeat);
         unsub();
@@ -49,7 +65,7 @@ export async function GET() {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
-      "X-Accel-Buffering": "no", // disable nginx buffering
+      "X-Accel-Buffering": "no",
     },
   });
 }
@@ -72,30 +88,64 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Missing required fields: lat, lng, type" }, { status: 422 });
   }
 
+  const id = randomUUID();
+  const now = new Date();
+  const safeIntensity = typeof intensity === "number" ? Math.min(1, Math.max(0, intensity)) : 0.5;
+
+  // Persist to Neon
+  await db.insert(anomalies).values({
+    id,
+    lat,
+    lng,
+    type: type as "pothole" | "speedbreaker" | "breakdown",
+    intensity: safeIntensity,
+    location: location ?? "User reported",
+    hits: 1,
+    status: "reported",
+    photoUrl: photoUrl ?? null,
+    createdAt: now,
+  });
+
   const anomaly: RoadAnomaly = {
-    id: randomUUID(),
+    id,
     lat,
     lng,
     type: type as RoadAnomaly["type"],
-    intensity: typeof intensity === "number" ? Math.min(1, Math.max(0, intensity)) : 0.5,
-    timestamp: new Date().toISOString(),
+    intensity: safeIntensity,
+    timestamp: now.toISOString(),
     location: location ?? "User reported",
     hits: 1,
     status: "reported",
     ...(photoUrl ? { photoUrl } : {}),
   };
 
-  addAnomaly(anomaly);
+  // Broadcast to all connected SSE clients
+  broadcast(anomaly);
 
-  // Forward to Go backend if configured (non-blocking, best-effort)
+  // Forward to Go backend if configured (fire-and-forget)
   const goBackend = process.env.GO_BACKEND_URL;
   if (goBackend) {
     fetch(`${goBackend}/api/v1/anomalies`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(anomaly),
-    }).catch(() => {}); // fire-and-forget
+    }).catch(() => {});
   }
 
   return NextResponse.json(anomaly, { status: 201 });
+}
+
+function rowToAnomaly(row: typeof anomalies.$inferSelect): RoadAnomaly {
+  return {
+    id: row.id,
+    lat: row.lat,
+    lng: row.lng,
+    type: row.type,
+    intensity: row.intensity,
+    timestamp: row.createdAt.toISOString(),
+    location: row.location ?? undefined,
+    hits: row.hits,
+    status: row.status,
+    photoUrl: row.photoUrl ?? undefined,
+  };
 }
